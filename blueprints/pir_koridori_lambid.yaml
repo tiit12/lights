@@ -1,0 +1,227 @@
+blueprint:
+  name: PIR-iga juhitavad lambid
+  description: >-
+    Lülitab lambid PIR-i liikumise peale sisse (päeval ja öösel eri heledusega).
+    Lambid kustuvad alles siis, kui kõik PIR-id on olnud määratud aja järjest
+    vabad – iga uus liikumine pikendab põlemisaega.
+
+
+    Valikuliselt hoiab lampide toitelüliti (relee) alati sees, et Zigbee lambid
+    ei läheks kogemata lüliti vajutusest võrgust ära.
+  domain: automation
+  author: Tiit
+  homeassistant:
+    min_version: 2024.6.0
+  input:
+    andurid:
+      name: Andurid
+      icon: mdi:motion-sensor
+      input:
+        motion_sensors:
+          name: Liikumisandurid (PIR)
+          description: Üks või mitu PIR-i. Lambid kustuvad alles siis, kui kõik on vabad.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: binary_sensor
+                  device_class:
+                    - motion
+                    - occupancy
+                    - presence
+        lux_sensors:
+          name: Valgusandurid
+          description: >-
+            Valikuline. Lambid süttivad ainult siis, kui kõik valgusandurid näitavad
+            alla piiri. Tühjaks jättes süttivad lambid liikumise peale alati.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: sensor
+                  device_class: illuminance
+        lux_threshold:
+          name: Valgustatuse piir
+          default: 20
+          selector:
+            number:
+              min: 0
+              max: 1000
+              unit_of_measurement: lx
+              mode: box
+    lambid:
+      name: Lambid
+      icon: mdi:lightbulb-group
+      input:
+        lights:
+          name: Lambid
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: light
+        day_brightness:
+          name: Heledus päeval
+          default: 100
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: '%'
+        night_brightness:
+          name: Heledus öösel
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: '%'
+        transition:
+          name: Sujuv üleminek
+          default: 2
+          selector:
+            number:
+              min: 0
+              max: 10
+              unit_of_measurement: s
+    ajastus:
+      name: Ajastus
+      icon: mdi:timer-outline
+      input:
+        off_delay:
+          name: Põlemisaeg pärast viimast liikumist
+          default:
+            minutes: 2
+          selector:
+            duration: {}
+        night_start:
+          name: Öörežiimi algus
+          default: '22:00:00'
+          selector:
+            time: {}
+        night_end:
+          name: Öörežiimi lõpp
+          default: '07:00:00'
+          selector:
+            time: {}
+    toide:
+      name: Toitelüliti
+      icon: mdi:power-socket-eu
+      collapsed: true
+      input:
+        power_switches:
+          name: Lampide toitelüliti(d)
+          description: >-
+            Valikuline. Relee, mis annab lampidele voolu. Kui see lülitub välja,
+            lülitatakse see kohe uuesti sisse.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: switch
+
+mode: queued
+max: 10
+
+trigger_variables:
+  power_switches: !input power_switches
+
+variables:
+  lights: !input lights
+  lux_sensors: !input lux_sensors
+  lux_threshold: !input lux_threshold
+
+triggers:
+  - trigger: state
+    entity_id: !input motion_sensors
+    to: 'on'
+    not_from:
+      - unavailable
+      - unknown
+    id: liikumine
+  - trigger: state
+    entity_id: !input motion_sensors
+    to: 'off'
+    for: !input off_delay
+    id: vaikus
+  - trigger: template
+    value_template: "{{ power_switches | select('is_state', 'off') | list | count > 0 }}"
+    id: lyliti_valjas
+  - trigger: homeassistant
+    event: start
+    id: lyliti_valjas
+
+conditions: []
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: liikumine
+          - condition: template
+            value_template: >-
+              {{ lux_sensors | count == 0
+                 or lux_sensors | map('states') | map('float', 0) | max < lux_threshold }}
+        sequence:
+          - if:
+              - condition: time
+                after: !input night_start
+                before: !input night_end
+            then:
+              - action: light.turn_on
+                target:
+                  entity_id: !input lights
+                data:
+                  brightness_pct: !input night_brightness
+                  transition: !input transition
+            else:
+              - action: light.turn_on
+                target:
+                  entity_id: !input lights
+                data:
+                  brightness_pct: !input day_brightness
+                  transition: !input transition
+      - conditions:
+          - condition: trigger
+            id: vaikus
+          # Kõik PIR-id peavad olema olnud vabad – muidu kustutaks esimesena
+          # vabanenud anduri trigger tule liiga vara.
+          - condition: state
+            entity_id: !input motion_sensors
+            state: 'off'
+            for: !input off_delay
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: !input lights
+            data:
+              transition: !input transition
+      - conditions:
+          - condition: trigger
+            id: lyliti_valjas
+          - condition: template
+            value_template: "{{ power_switches | select('is_state', 'off') | list | count > 0 }}"
+        sequence:
+          # Zigbee lambid peavad olema kogu aeg vooluvõrgus
+          - action: switch.turn_on
+            target:
+              entity_id: "{{ power_switches | select('is_state', 'off') | list }}"
+          # Lühikese voolukatkestuse ajal ei jõua lambid HA-s "unavailable" olekusse
+          # minna, seega anname neile aega käivituda ja Zigbee võrku naasta
+          - delay:
+              seconds: 10
+          - wait_template: >-
+              {{ lights | map('states') | select('eq', 'unavailable') | list | count == 0 }}
+            timeout:
+              seconds: 30
+          # Pärast voolu tagasitulekut süttivad lambid tavaliselt täisheledusega
+          - condition: state
+            entity_id: !input motion_sensors
+            state: 'off'
+          - action: light.turn_off
+            target:
+              entity_id: !input lights
+            data:
+              transition: !input transition
